@@ -1,0 +1,191 @@
+version: '2.1'
+
+orbs:
+  aws-cli: circleci/aws-cli@3.1
+  node: circleci/node@5.0.2
+ 
+jobs:
+
+  #Build React app
+  build-app:
+    docker:
+      - image: 'cimg/base:stable'
+    steps:
+      - checkout
+      - node/install:
+          node-version: '16.15'
+      - run:
+            name: Node version
+            command: node --version
+      - restore_cache:
+            keys:
+              - v1-dependencies-{{ checksum "npm-shrinkwrap.json" }}
+              #Fallback on empty cache
+              - v1-dependencies-
+      - run:
+            name: Npm install
+            command: npm ci
+      - run:
+            name: Npm build
+            command: npm run build
+      - save_cache:
+          key: v1-dependencies-{{ checksum "npm-shrinkwrap.json" }}
+          paths:
+            - node_modules
+      - persist_to_workspace:
+          root: .
+          paths:
+            - '*'
+
+  #Unit Test React app
+  unit-test:
+    docker:
+      - image: 'cimg/base:stable'
+    steps:
+      - attach_workspace:
+          at: .
+      - node/install:
+          node-version: '16.15'
+      - run:
+            name: Node version
+            command: node --version
+      - restore_cache:
+            keys:
+              - v1-dependencies-{{ checksum "npm-shrinkwrap.json" }}
+              #Fallback on empty cache
+              - v1-dependencies-
+      - run:
+            name: Run test
+            command: npm run test
+
+  #Save artifact to S3 bucket
+  save-artifact:
+    executor: aws-cli/default
+    steps:
+      - attach_workspace:
+          at: .
+      - aws-cli/setup:
+          profile-name: default            
+      #Save the artifact into a zip file. This file will be published as artifact in the job save-artifact.
+      - run: 
+            name: Save artifact to CircleCI
+            command: |
+              set -e
+              cd ./build && zip -r ../artifact.zip .
+      #Persist the artifact url to be used in the deployments steps
+      - run:
+            name: Save artifact url
+            command: echo "https://output.circle-artifacts.com/output/job/$CIRCLE_WORKFLOW_JOB_ID/artifacts/0/artifact.zip" > url_artifact.build           
+      - store_artifacts:
+          path: ./artifact.zip
+          destination: artifact.zip
+      - persist_to_workspace:
+          root: .
+          paths:
+            - '*'
+
+  #Provision AWS Amplify FrontEnd Infrastructure
+  provision-amplify:
+    executor: aws-cli/default
+    steps:
+      - aws-cli/setup:
+          profile-name: default
+      #Creates a base Amplify app with aws cli
+      - run:
+            #This section will create the Amplify application. To rename the app change the --name variable
+            name: Provision Amplify FrontEnd Infrastructure            
+            command: aws amplify create-app --name $CIRCLE_PROJECT_REPONAME-$CIRCLE_BUILD_NUM --platform 'WEB'
+      #Creates a branch in the Amplify app created in the last step, and persists the app id to be used in the deployment steps
+      - run:
+            name: Create Amplify Branch
+            command: |
+              APPID=$(aws amplify list-apps | jq ".apps[] | select(.name ==\"$CIRCLE_PROJECT_REPONAME-$CIRCLE_BUILD_NUM\") | .appId" | sed 's/\"//g')                            
+              echo $APPID > app_id.build #Persists app id to deploy
+              aws amplify create-branch --app-id $APPID --branch-name $CIRCLE_BRANCH
+      - persist_to_workspace:
+          root: .
+          paths:
+            - '*'
+
+  #Deploy react app to amplify
+  deploy-amplify:
+    executor: aws-cli/default
+    steps:
+      - attach_workspace:
+          at: .
+      - aws-cli/setup:
+          profile-name: default
+      #Creates temporary variables for URL_ARTIFACT and APPID and start a new deployment in the Amplify app created in provision-amplify
+      - run:
+            name: Deploy React App
+            command: |
+              URL_ARTIFACT=$(cat url_artifact.build)
+              APPID=$(cat app_id.build)
+              echo $URL_ARTIFACT
+              aws amplify start-deployment --app-id $APPID --branch-name $CIRCLE_BRANCH --source-url $URL_ARTIFACT
+
+workflows:
+  amplify-app:
+    jobs:
+      - build-app:
+          context: 
+            - amplify-dev
+            - aws-dev
+      - unit-test:
+          context: 
+            - amplify-dev
+            - aws-dev
+          requires:
+            - build-app
+      - save-artifact:
+          requires:
+            - unit-test
+          context: 
+            - amplify-dev
+            - aws-dev
+      - provision-amplify:
+          name: provision-amplify-dev          
+          requires:
+            - save-artifact
+          context: 
+            - amplify-dev
+            - aws-dev
+      - deploy-amplify:
+          name: deploy-amplify-dev
+          requires:
+              - provision-amplify-dev
+          context: 
+            - amplify-dev
+            - aws-dev
+      - provision-amplify:
+          name: provision-amplify-qa
+          requires:
+            - deploy-amplify-dev
+          context: 
+            - amplify-qa
+            - aws-qa
+      - deploy-amplify:
+          name: deploy-amplify-qa
+          requires:
+              - provision-amplify-qa
+          context: 
+            - amplify-qa
+            - aws-qa
+      - approve-deploy-prod:
+          type: approval
+          requires:
+              - deploy-amplify-qa
+      - provision-amplify:
+          name: provision-amplify-prod
+          requires:
+            - approve-deploy-prod
+          context: 
+            - amplify-prod
+            - aws-prod
+      - deploy-amplify:
+          name: deploy-amplify-prod
+          requires:
+              - provision-amplify-prod
+          context: 
+            - amplify-prod
+            - aws-prod
